@@ -31,9 +31,12 @@ import json
 import os
 import re
 import sys
+import time
+import shutil
 sys.setrecursionlimit(10000)
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 from typing import Optional
 
 import requests
@@ -43,6 +46,8 @@ from playwright.async_api import async_playwright
 
 CLALIT_URL = "https://e-services.clalit.co.il/OnlineWeb/Services/Tamuz/TamuzTransfer.aspx"
 AZCAPTCHA_DEFAULT_KEY = "8c0ea55dab3a542494b70ca16ad0b93e32357f26"
+NVIDIA_API_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
+CAPTCHA_DIR = "captchas"
 
 SPECIALTIES = [
     "עור", "אורתופדיה", "קרדיולוגיה", "נוירולוגיה",
@@ -88,17 +93,19 @@ def load_env(path: str = ".env") -> None:
                 key, _, value = line.partition("=")
                 os.environ.setdefault(key.strip(), value.strip())
 
-# ── captcha ─────────────────────────────────────────────────────────────────
+# ── captcha image helpers ────────────────────────────────────────────────────
 
-async def solve_captcha_azcaptcha(page, api_key: str) -> str:
-    captcha_img = await page.query_selector(
-        "#c_general_login_ctl00_cphbody__loginview_captchalogin_CaptchaImage"
-    )
+CAPTCHA_SELECTOR = "#c_general_login_ctl00_cphbody__loginview_captchalogin_CaptchaImage"
+
+async def _capture_captcha_image(page) -> tuple[str, str]:
+    """Download the captcha image from the page. Returns (filepath, base64)."""
+    os.makedirs(CAPTCHA_DIR, exist_ok=True)
+    captcha_img = await page.query_selector(CAPTCHA_SELECTOR)
     if not captcha_img:
-        return ""
+        raise RuntimeError("Captcha image element not found on page")
     src = await captcha_img.get_attribute("src")
     if not src:
-        return ""
+        raise RuntimeError("Captcha image has no src attribute")
     base_url = page.url.split("/OnlineWeb")[0]
     captcha_url = base_url + src if src.startswith("/") else src
 
@@ -106,14 +113,40 @@ async def solve_captcha_azcaptcha(page, api_key: str) -> str:
     resp = requests.get(captcha_url, timeout=30)
     resp.raise_for_status()
     image_b64 = base64.b64encode(resp.content).decode("utf-8")
+    filepath = os.path.join(CAPTCHA_DIR, "captcha.png")
+    with open(filepath, "wb") as f:
+        f.write(resp.content)
 
+    if os.path.getsize(filepath) < 100:
+        print("   Warning: captcha image is very small, may be invalid")
+
+    return filepath, image_b64
+
+
+def _validate_captcha_text(text: str) -> bool:
+    """Check if CAPTCHA text looks valid (exactly 5 alphanumeric characters)."""
+    if not text:
+        return False
+    if len(text) != 5:
+        return False
+    return all(c.isascii() and c.isalnum() for c in text)
+
+
+def _enter_captcha_on_page(page, captcha_text: str) -> None:
+    evaluate = page.evaluate
+    evaluate("""(text) => {
+        var el = document.querySelector('#ctl00_cphBody__loginView_tbCaptchaLogin');
+        if (el) { el.value = text; el.dispatchEvent(new Event('input', {bubbles: true})); }
+    }""", captcha_text)
+
+# ── AzCaptcha solver ────────────────────────────────────────────────────────
+
+def _solve_azcaptcha_sync(image_b64: str, api_key: str) -> str:
+    """Synchronous AzCaptcha solve (called from fallback path)."""
     print("   Solving captcha via AzCaptcha...")
     task = requests.post(
         "https://azcaptcha.com/createTask",
-        json={
-            "clientKey": api_key,
-            "task": {"type": "ImageToTextTask", "body": image_b64},
-        },
+        json={"clientKey": api_key, "task": {"type": "ImageToTextTask", "body": image_b64}},
         timeout=30,
     ).json()
     task_id = task.get("taskId")
@@ -121,17 +154,125 @@ async def solve_captcha_azcaptcha(page, api_key: str) -> str:
         raise RuntimeError(f"AzCaptcha createTask failed: {task}")
 
     for _ in range(30):
-        await asyncio.sleep(3)
+        time.sleep(3)
         r = requests.post(
             "https://azcaptcha.com/getTaskResult",
             json={"clientKey": api_key, "taskId": task_id},
             timeout=30,
         ).json()
         if r.get("status") == "ready":
-            solution = r["solution"]["text"]
-            print(f"   Captcha solved: {solution}")
-            return solution
-    raise TimeoutError("AzCaptcha did not solve captcha in time")
+            solution = r["solution"]["text"].strip()
+            if solution:
+                print(f"   AzCaptcha solved: {solution}")
+                return solution
+            raise RuntimeError(f"AzCaptcha returned empty text: {r}")
+        if r.get("status") == "error":
+            raise RuntimeError(f"AzCaptcha error: {r}")
+    raise TimeoutError("AzCaptcha solving timed out")
+
+# ── NVIDIA Llama 3.2 Vision solver (with AzCaptcha fallback) ────────────────
+
+_NVIDIA_PROMPTS = [
+    "CAPTCHA text (5 uppercase letters):",
+    "Exactly 5 uppercase letters only:",
+]
+
+def _solve_nvidia_sync(image_b64: str, api_key: str, prompt_idx: int = 0) -> str:
+    """Single NVIDIA API call. Returns the raw text from the model."""
+    payload = {
+        "model": "meta/llama-3.2-11b-vision-instruct",
+        "messages": [
+            {"role": "system", "content": "Output only the 5-character CAPTCHA code. No other text."},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_b64}"}},
+                    {"type": "text", "text": _NVIDIA_PROMPTS[prompt_idx]},
+                ],
+            },
+        ],
+        "max_tokens": 10,
+        "temperature": 0.2,
+        "top_p": 0.1,
+        "stream": False,
+    }
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
+    resp = requests.post(NVIDIA_API_URL, json=payload, headers=headers, timeout=90)
+    if resp.status_code != 200:
+        raise RuntimeError(f"NVIDIA API error: {resp.status_code} {resp.text[:200]}")
+    result = resp.json()
+    raw = result["choices"][0]["message"]["content"]
+    matches = re.findall(r'[A-Za-z0-9]+', raw)
+    return matches[-1] if matches else ""
+
+
+def solve_captcha(page, captcha_provider: str,
+                  nvidia_api_key: str, azcaptcha_api_key: str) -> str:
+    """Solve the Clalit login CAPTCHA.
+
+    Tries NVIDIA Llama 3.2 Vision up to 5 error-retries, falling back to
+    AzCaptcha when exhausted. Bad output (≠5 chars) retries the same image
+    without consuming a retry count.
+    """
+    if captcha_provider == "manual":
+        filepath, image_b64 = asyncio.get_event_loop().run_until_complete(
+            _capture_captcha_image(page)
+        )
+        print(f"   Captcha image saved to {filepath}. Enter code manually:")
+        return input("   Captcha code: ").strip()
+
+    filepath, image_b64 = asyncio.get_event_loop().run_until_complete(
+        _capture_captcha_image(page)
+    )
+
+    if captcha_provider == "azcaptcha":
+        return _solve_azcaptcha_sync(image_b64, azcaptcha_api_key)
+
+    if captcha_provider != "nvidia" or not nvidia_api_key:
+        return _solve_azcaptcha_sync(image_b64, azcaptcha_api_key)
+
+    # NVIDIA path with AzCaptcha fallback
+    print("   Solving captcha via NVIDIA Llama 3.2 Vision...")
+    _t0 = time.time()
+    error_count = 0
+    call_count = 0
+
+    while True:
+        try:
+            if call_count > 0:
+                print("   Retrying NVIDIA with same image...")
+
+            prompt_idx = min(call_count, len(_NVIDIA_PROMPTS) - 1)
+            call_count += 1
+
+            captcha_text = _solve_nvidia_sync(image_b64, nvidia_api_key, prompt_idx)
+            print(f"   NVIDIA reply: {captcha_text!r}")
+
+            if captcha_text and _validate_captcha_text(captcha_text):
+                elapsed = time.time() - _t0
+                print(f"   Solved in {elapsed:.1f}s ({call_count} call(s), {error_count} error(s))")
+                saved = os.path.join(CAPTCHA_DIR, f"{captcha_text}.png")
+                try:
+                    shutil.copy2(filepath, saved)
+                except Exception:
+                    pass
+                return captcha_text
+
+            print("   Bad output — retrying (no error retry consumed)...")
+
+        except Exception as e:
+            error_count += 1
+            print(f"   NVIDIA error {error_count}/5: {e}")
+            if error_count < 5:
+                time.sleep(2)
+                continue
+            print("   NVIDIA failed after 5 error retries. Falling back to AzCaptcha...")
+            return _solve_azcaptcha_sync(image_b64, azcaptcha_api_key)
+
 
 # ── overlay helpers ─────────────────────────────────────────────────────────
 
@@ -145,6 +286,7 @@ async def remove_overlays(frame) -> None:
 # ── login ───────────────────────────────────────────────────────────────────
 
 async def login(page, user_id: str, username: str, password: str,
+                captcha_provider: str, nvidia_api_key: str,
                 azcaptcha_key: str) -> None:
     print("1. Logging in...")
     await page.goto(CLALIT_URL, wait_until="networkidle", timeout=30000)
@@ -154,17 +296,13 @@ async def login(page, user_id: str, username: str, password: str,
     await page.fill("#ctl00_cphBody__loginView_tbUserName", username)
     await page.fill("#ctl00_cphBody__loginView_tbPassword", password)
 
-    if azcaptcha_key:
-        captcha_text = await solve_captcha_azcaptcha(page, azcaptcha_key)
-        if captcha_text:
-            await page.evaluate("""(text) => {
-                var el = document.querySelector('#ctl00_cphBody__loginView_tbCaptchaLogin');
-                if (el) { el.value = text; el.dispatchEvent(new Event('input', {bubbles: true})); }
-            }""", captcha_text)
-            await asyncio.sleep(0.3)
-            inp = await page.query_selector("#ctl00_cphBody__loginView_tbCaptchaLogin")
-            if inp:
-                await inp.press("Enter")
+    captcha_text = solve_captcha(page, captcha_provider, nvidia_api_key, azcaptcha_key)
+    if captcha_text:
+        _enter_captcha_on_page(page, captcha_text)
+        await asyncio.sleep(0.3)
+        inp = await page.query_selector("#ctl00_cphBody__loginView_tbCaptchaLogin")
+        if inp:
+            await inp.press("Enter")
 
     await page.wait_for_load_state("networkidle", timeout=20000)
     await asyncio.sleep(3)
@@ -424,7 +562,8 @@ def pick_best_slot(doctor_slots_map: dict[str, dict[str, list[str]]],
 
 # ── search mode ─────────────────────────────────────────────────────────────
 
-async def run_search(specialty: str, city: str, azcaptcha_key: str,
+async def run_search(specialty: str, city: str,
+                     captcha_provider: str, nvidia_api_key: str, azcaptcha_key: str,
                      headless: bool = False, fetch_slots: bool = True) -> list[dict]:
     user_id = os.environ.get("CLALIT_USER_ID", "")
     username = os.environ.get("CLALIT_USERNAME", "")
@@ -442,7 +581,8 @@ async def run_search(specialty: str, city: str, azcaptcha_key: str,
         page = await ctx.new_page()
 
         try:
-            await login(page, user_id, username, password, azcaptcha_key)
+            await login(page, user_id, username, password,
+                        captcha_provider, nvidia_api_key, azcaptcha_key)
             f = await navigate_to_search(page)
             await select_specialty(f, specialty)
             await select_city(f, city)
@@ -466,7 +606,8 @@ async def run_search(specialty: str, city: str, azcaptcha_key: str,
 
 # ── find-best mode ─────────────────────────────────────────────────────────
 
-async def run_find_best(specialty: str, city: str, azcaptcha_key: str,
+async def run_find_best(specialty: str, city: str,
+                        captcha_provider: str, nvidia_api_key: str, azcaptcha_key: str,
                         headless: bool = False,
                         cutoff_date: str = "30.08.2026",
                         cutoff_before_hour: int = 11) -> dict:
@@ -486,7 +627,8 @@ async def run_find_best(specialty: str, city: str, azcaptcha_key: str,
         page = await ctx.new_page()
 
         try:
-            await login(page, user_id, username, password, azcaptcha_key)
+            await login(page, user_id, username, password,
+                        captcha_provider, nvidia_api_key, azcaptcha_key)
             f = await navigate_to_search(page)
             await select_specialty(f, specialty)
             await select_city(f, city)
@@ -549,13 +691,25 @@ def main():
     parser.add_argument("--headless", action="store_true", help="Run headless")
     parser.add_argument("--json", action="store_true", help="JSON output")
     parser.add_argument("--no-slots", action="store_true", help="Skip fetching slots")
+    parser.add_argument("--captcha-provider",
+                        choices=["nvidia", "azcaptcha", "manual"],
+                        help="Captcha provider (default: nvidia if NVIDIA_API_KEY set)")
+    parser.add_argument("--nvidia-api-key", help="NVIDIA API key for Llama Vision captcha")
     parser.add_argument("--azcaptcha-key", help="AzCaptcha API key")
     parser.add_argument("--env", default=".env", help="Env file path")
     parser.add_argument("--list-specialties", action="store_true", help="List specialties")
     args = parser.parse_args()
 
     load_env(args.env)
+
+    nvidia_api_key = args.nvidia_api_key or os.environ.get("NVIDIA_API_KEY", "")
     azcaptcha_key = args.azcaptcha_key or os.environ.get("AZCAPTCHA_API_KEY") or AZCAPTCHA_DEFAULT_KEY
+
+    captcha_provider = args.captcha_provider
+    if not captcha_provider:
+        captcha_provider = os.environ.get("CAPTCHA_PROVIDER", "")
+    if not captcha_provider:
+        captcha_provider = "nvidia" if nvidia_api_key else "azcaptcha"
 
     if args.list_specialties:
         print("Available specialties:")
@@ -565,7 +719,8 @@ def main():
 
     if args.mode == "search":
         results = asyncio.run(run_search(
-            args.specialty, args.city, azcaptcha_key,
+            args.specialty, args.city,
+            captcha_provider, nvidia_api_key, azcaptcha_key,
             args.headless, not args.no_slots,
         ))
         if args.json:
@@ -583,7 +738,9 @@ def main():
 
     elif args.mode == "find-best":
         result = asyncio.run(run_find_best(
-            args.specialty, args.city, azcaptcha_key, args.headless,
+            args.specialty, args.city,
+            captcha_provider, nvidia_api_key, azcaptcha_key,
+            args.headless,
         ))
         if args.json:
             print(json.dumps(result, ensure_ascii=False, indent=2))
@@ -608,7 +765,8 @@ def main():
                 ctx = await b.new_context(viewport={"width": 1280, "height": 900}, locale="he-IL")
                 page = await ctx.new_page()
                 try:
-                    await login(page, user_id, username, password, azcaptcha_key)
+                    await login(page, user_id, username, password,
+                                captcha_provider, nvidia_api_key, azcaptcha_key)
                     f = await navigate_to_search(page)
                     date_parts = args.date.split(".")
                     day = date_parts[0].lstrip("0")
